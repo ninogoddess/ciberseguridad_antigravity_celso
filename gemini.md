@@ -101,4 +101,22 @@ c:\CELSO\
 
 ---
 
-*Last updated: 2026-04-13 | Protocol 0 Initialization*
+## 🛠️ Maintenance & Operations Log
+
+### Scaling the Dashboard
+- **Adding Users**: Update the `initialState.users` list in `src/App.jsx`.
+- **New Incident Types**: Modify the `severity` badges in `index.css` if new levels (e.g., 'informational') are added.
+- **Audit Logic**: The `diffing` engine automatically detects and logs any key-value change in the incident object.
+
+### Deployment Triggers
+1. **Build**: Run `npm run build` to generate the `/dist` folder.
+2. **Cloud**: The `/dist` folder is production-ready for Vercel, Netlify, or AWS S3.
+
+---
+
+## ✅ Mission Debrief
+- **Status**: COMPLETE
+- **Deployment**: Local + Git Initialized
+- **Compliance**: B.L.A.S.T. v1.0 / A.N.T. 3-Layer Verified
+
+*Final Update: 2026-04-13 | Mission Accomplished*
