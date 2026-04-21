@@ -28,7 +28,7 @@ const initialState = {
   currentUser: { id: "u1", name: "Admin User", role: "admin" },
   users: [
     { id: "u1", name: "Admin User", role: "admin", email: "admin@soc.pilot", permissions: "Full Read/Write Access" },
-    { id: "u2", name: "Operator Joe", role: "operator", email: "j.doe@soc.pilot", permissions: "Incident Management Only" },
+    { id: "u2", name: "Analyst Joe", role: "analyst", email: "j.doe@soc.pilot", permissions: "Incident Management Only" },
     { id: "u3", name: "Viewer Sam", role: "viewer", email: "sam.v@soc.pilot", permissions: "Read-Only Observer" }
   ],
   incidents: [
@@ -45,6 +45,20 @@ const initialState = {
 };
 
 /**
+ * RBAC ENGINE
+ */
+const RBAC = {
+  canEditStatus: (role) => ['admin', 'analyst'].includes(role),
+  canEscalate: (role) => role === 'admin',
+  canAssign: (role, assigneeId, currentUserId) => {
+    if (role === 'admin') return true;
+    if (role === 'analyst') return assigneeId === currentUserId;
+    return false;
+  },
+  canAddNote: (role) => ['admin', 'analyst'].includes(role)
+};
+
+/**
  * REDUCER
  */
 function socReducer(state, action) {
@@ -53,18 +67,70 @@ function socReducer(state, action) {
     case 'SWITCH_USER':
       return { ...state, currentUser: state.users.find(u => u.id === action.userId) || state.currentUser };
     case 'UPDATE_INCIDENT':
-      if (state.currentUser.role === 'viewer') return state;
+      if (state.currentUser.role === 'viewer') {
+        console.error('RBAC BLOCK: Viewers cannot mutate state.');
+        return state;
+      }
       const idx = state.incidents.findIndex(i => i.id === action.incidentId);
       if (idx === -1) return state;
       const old = state.incidents[idx];
-      if (action.updates.isBeingEscalated && old.isBeingEscalated) return state;
-      const updated = { ...old, ...action.updates };
+      const updates = { ...action.updates };
+      const role = state.currentUser.role;
+
+      // INTERNAL SECURITY VALIDATIONS
+      if ('isBeingEscalated' in updates && updates.isBeingEscalated !== old.isBeingEscalated) {
+        if (!RBAC.canEscalate(role)) {
+          console.error(`RBAC BLOCK: Role '${role}' lacks permission to ESCALATE.`);
+          return state;
+        }
+      }
+      if ('status' in updates && updates.status !== old.status) {
+        if (!RBAC.canEditStatus(role)) {
+          console.error(`RBAC BLOCK: Role '${role}' lacks permission to change STATUS.`);
+          return state;
+        }
+      }
+      if ('assignedTo' in updates && updates.assignedTo !== old.assignedTo) {
+        if (!RBAC.canAssign(role, updates.assignedTo, state.currentUser.id)) {
+          console.error(`RBAC BLOCK: Role '${role}' lacks permission to ASSIGN.`);
+          return state;
+        }
+      }
+      
+      // Notes handler
+      if ('newNote' in updates) {
+        if (!RBAC.canAddNote(role)) {
+          console.error(`RBAC BLOCK: Role '${role}' lacks permission to add NOTES.`);
+          return state;
+        }
+        const currentNotes = old.notes || [];
+        updates.notes = [...currentNotes, { id: `nt-${Date.now()}`, author: state.currentUser.name, text: updates.newNote }];
+        delete updates.newNote;
+      }
+
+      if (updates.isBeingEscalated && old.isBeingEscalated) return state;
+      
+      const updated = { ...old, ...updates };
       const newIncidents = [...state.incidents];
       newIncidents[idx] = updated;
-      const diff = [];
-      Object.keys(action.updates).forEach(key => { if (old[key] !== updated[key]) diff.push({ field: key, from: String(old[key]), to: String(updated[key]) }); });
-      const newLog = { id: `aud-${Date.now()}`, userId: state.currentUser.id, userName: state.currentUser.name, targetId: action.incidentId, action: action.actionLabel, timestamp, diff };
-      return { ...state, incidents: newIncidents, auditLog: [newLog, ...state.auditLog] };
+      const newLogs = [];
+      Object.keys(action.updates).forEach(key => {
+        if (old[key] !== updated[key]) {
+          let actLog = key === 'status' ? 'STATUS_CHANGE' : key === 'assignedTo' ? 'ASSIGNMENT' : key === 'isBeingEscalated' ? 'ESCALATION' : 'UPDATE';
+          newLogs.push({
+             id: `aud-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
+             incidentId: action.incidentId,
+             action: actLog,
+             userId: state.currentUser.id,
+             userName: state.currentUser.name,
+             timestamp,
+             field: key,
+             previousValue: String(old[key] || 'None'),
+             newValue: String(updated[key] || 'None')
+          });
+        }
+      });
+      return { ...state, incidents: newIncidents, auditLog: [...newLogs, ...state.auditLog] };
     case 'AUTO_RELEASE_LOCK':
       return { ...state, incidents: state.incidents.map(inc => inc.id === action.incidentId ? { ...inc, isBeingEscalated: false } : inc) };
     default: return state;
@@ -101,6 +167,7 @@ const StatCard = ({ icon: Icon, label, value, color }) => (
 export default function App() {
   const [state, dispatch] = useReducer(socReducer, initialState);
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [expandedIncidentId, setExpandedIncidentId] = useState(null);
   const locksRef = useRef({});
 
   useEffect(() => {
@@ -169,28 +236,75 @@ export default function App() {
             </section>
             <div style={{ display: 'grid', gap: '16px' }}>
               {state.incidents.map((inc, i) => (
-                <div key={inc.id} className={`card ${inc.severity === 'critical' ? 'critical' : ''}`} style={{ animationDelay: `${i * 0.1}s`, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <div style={{ display: 'flex', gap: '24px', alignItems: 'center' }}>
-                    <div style={{ height: '40px', width: '2px', background: inc.severity === 'critical' ? 'var(--danger)' : 'var(--primary)', opacity: inc.status === 'resolved' ? 0.2 : 1 }} />
-                    <div>
-                      <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginBottom: '8px' }}>
-                        <span className={`incident-badge badge-${inc.severity}`}>{inc.severity}</span>
-                        <span style={{ color: 'var(--text-muted)', fontSize: '11px', fontWeight: 700 }}>{inc.id}</span>
+                <div key={inc.id} className={`card ${inc.severity === 'critical' ? 'critical' : ''}`} style={{ animationDelay: `${i * 0.1}s`, display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <div style={{ display: 'flex', gap: '24px', alignItems: 'center', cursor: 'pointer' }} onClick={() => setExpandedIncidentId(expandedIncidentId === inc.id ? null : inc.id)}>
+                      <div style={{ height: '40px', width: '2px', background: inc.severity === 'critical' ? 'var(--danger)' : 'var(--primary)', opacity: inc.status === 'resolved' ? 0.2 : 1 }} />
+                      <div>
+                        <div style={{ display: 'flex', gap: '12px', alignItems: 'center', marginBottom: '8px' }}>
+                          <span className={`incident-badge badge-${inc.severity}`}>{inc.severity}</span>
+                          <span style={{ color: 'var(--text-muted)', fontSize: '11px', fontWeight: 700 }}>{inc.id}</span>
+                        </div>
+                        <h3 style={{ fontSize: '20px', fontWeight: 800, marginBottom: '6px' }}>{inc.title}</h3>
+                        <p style={{ color: 'var(--text-muted)', fontSize: '14px', maxWidth: '700px' }}>{inc.description}</p>
                       </div>
-                      <h3 style={{ fontSize: '20px', fontWeight: 800, marginBottom: '6px' }}>{inc.title}</h3>
-                      <p style={{ color: 'var(--text-muted)', fontSize: '14px', maxWidth: '700px' }}>{inc.description}</p>
+                    </div>
+                     <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
+                      {inc.status === 'resolved' ? ( <div style={{ color: 'var(--success)', fontWeight: 900, fontSize: '12px' }}>✓ SYSTEM_SAFE</div> ) : (
+                        <>
+                          <button className="btn" disabled={!RBAC.canAssign(state.currentUser.role, state.currentUser.id, state.currentUser.id) || (inc.assignedTo && state.currentUser.role !== 'admin')} onClick={(e) => { e.stopPropagation(); dispatch({ type: 'UPDATE_INCIDENT', incidentId: inc.id, updates: { assignedTo: state.currentUser.id } }) }} style={{ background: 'transparent', color: 'var(--text-primary)', border: `1px solid ${inc.assignedTo ? 'var(--border)' : 'var(--primary)'}` }}> {inc.assignedTo ? (state.currentUser.role === 'admin' && inc.assignedTo !== state.currentUser.id ? 'REASSIGN ALIAS' : 'ASSIGNED') : 'ASSIGN TO ME'} </button>
+                          <button className="btn" disabled={!RBAC.canEscalate(state.currentUser.role) || inc.isBeingEscalated} onClick={(e) => { e.stopPropagation(); dispatch({ type: 'UPDATE_INCIDENT', incidentId: inc.id, updates: { isBeingEscalated: true } }) }} style={{ background: inc.isBeingEscalated ? 'var(--bg-card-hover)' : 'var(--primary)', width: inc.isBeingEscalated ? '160px' : 'auto' }}>
+                            {inc.isBeingEscalated ? <span style={{display:'flex', alignItems:'center', gap:'8px'}}><Clock size={16}/> LOCK_15S</span> : 'ESCALATE'}
+                          </button>
+                          <button className="btn" disabled={!RBAC.canEditStatus(state.currentUser.role)} onClick={(e) => { e.stopPropagation(); dispatch({ type: 'UPDATE_INCIDENT', incidentId: inc.id, updates: { status: 'resolved', isBeingEscalated: false } }) }} style={{ background: 'transparent', color: 'var(--text-primary)', border: '1px solid rgba(255,255,255,0.2)' }}> RESOLVE </button>
+                        </>
+                      )}
                     </div>
                   </div>
-                   <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
-                    {inc.status === 'resolved' ? ( <div style={{ color: 'var(--success)', fontWeight: 900, fontSize: '12px' }}>✓ SYSTEM_SAFE</div> ) : (
-                      <>
-                        <button className="btn" disabled={state.currentUser.role === 'viewer' || inc.isBeingEscalated} onClick={() => dispatch({ type: 'UPDATE_INCIDENT', incidentId: inc.id, actionLabel: 'Escalation requested', updates: { isBeingEscalated: true } })} style={{ background: inc.isBeingEscalated ? '#333' : 'var(--primary)', width: inc.isBeingEscalated ? '160px' : 'auto' }}>
-                          {inc.isBeingEscalated ? <span style={{display:'flex', alignItems:'center', gap:'8px'}}><Clock size={16}/> LOCK_15S</span> : 'ESCALATE'}
-                        </button>
-                        <button className="btn" disabled={state.currentUser.role === 'viewer'} onClick={() => dispatch({ type: 'UPDATE_INCIDENT', incidentId: inc.id, actionLabel: 'Incident Resolved', updates: { status: 'resolved', isBeingEscalated: false } })} style={{ background: 'transparent', color: '#fff', border: '1px solid rgba(255,255,255,0.2)' }}> RESOLVE </button>
-                      </>
-                    )}
-                  </div>
+                  
+                  {expandedIncidentId === inc.id && (
+                    <div style={{ padding: '20px', borderTop: '1px solid var(--border)', marginTop: '8px', animation: 'fadeIn 0.3s ease-out' }}>
+                      {/* Notes Section */}
+                      <div style={{ marginBottom: '32px' }}>
+                        <h4 style={{ marginBottom: '12px', fontSize: '14px', color: 'var(--primary)' }}>Investigative Notes</h4>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '16px' }}>
+                          {(inc.notes || []).length === 0 && <div style={{ color: 'var(--text-muted)', fontSize: '12px' }}>No notes explicitly added.</div>}
+                          {(inc.notes || []).map(n => (
+                            <div key={n.id} style={{ background: 'rgba(255,255,255,0.05)', padding: '12px', borderRadius: '4px', fontSize: '13px' }}>
+                              <span style={{ fontWeight: 800, color: 'var(--primary)', marginRight: '8px' }}>{n.author}:</span>
+                              <span>{n.text}</span>
+                            </div>
+                          ))}
+                        </div>
+                        <form onSubmit={(e) => { e.preventDefault(); e.stopPropagation(); const val = e.target.elements.note.value; if(val) { dispatch({ type: 'UPDATE_INCIDENT', incidentId: inc.id, actionLabel: 'NOTE_ADDED', updates: { newNote: val } }); e.target.reset(); } }} onClick={e => e.stopPropagation()} style={{ display: 'flex', gap: '8px' }}>
+                          <input name="note" disabled={!RBAC.canAddNote(state.currentUser.role)} placeholder={RBAC.canAddNote(state.currentUser.role) ? "Append security note..." : "Viewers cannot append notes"} style={{ flex: 1, padding: '10px', background: 'transparent', border: '1px solid var(--border)', color: 'var(--text-primary)', borderRadius: '4px' }} />
+                          <button type="submit" disabled={!RBAC.canAddNote(state.currentUser.role)} className="btn" style={{ padding: '10px 20px' }}>APPEND</button>
+                        </form>
+                      </div>
+
+                      <h4 style={{ marginBottom: '16px', fontSize: '14px', color: 'var(--primary)' }}>Incident Timeline (Audit Log)</h4>
+                      {state.auditLog.filter(l => l.incidentId === inc.id).length === 0 ? <div style={{ color: 'var(--text-muted)', fontSize: '12px' }}>No actions logged yet.</div> : (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                          {state.auditLog.filter(l => l.incidentId === inc.id).map(log => (
+                            <div key={log.id} style={{ display: 'grid', gridTemplateColumns: '80px 1fr', gap: '16px', fontSize: '12px', alignItems: 'center', background: 'var(--bg-dark)', padding: '12px', borderRadius: '4px' }}>
+                              <div style={{ color: 'var(--text-muted)' }}>{new Date(log.timestamp).toLocaleTimeString()}</div>
+                              <div>
+                                 <span style={{ fontWeight: 800, marginRight: '8px', color: 'var(--text-primary)' }}>{log.userName}</span>
+                                 <span style={{ opacity: 0.7 }}>performed</span> 
+                                 <span style={{ fontWeight: 800, margin: '0 8px', color: 'var(--primary)' }}>{log.action}</span>
+                                 <span style={{ margin: '0 8px', opacity: 0.5 }}>on</span>
+                                 <span style={{ fontWeight: 800, opacity: 0.8 }}>{log.field.toUpperCase()}</span>
+                                 <br/>
+                                 <div style={{ marginTop: '4px' }}>
+                                   <span style={{ color: 'var(--danger)', textDecoration: 'line-through', fontSize: '11px' }}>{log.previousValue}</span> <ChevronRight size={10} style={{ margin: '0 4px', display: 'inline-block', verticalAlign: 'middle' }} /> <span style={{ color: 'var(--success)', fontSize: '11px' }}>{log.newValue}</span>
+                                 </div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -228,7 +342,7 @@ export default function App() {
               <div key={log.id} style={{ padding: '24px', borderBottom: '1px solid var(--border)' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '16px' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                    <div style={{ width: '32px', height: '32px', background: 'var(--primary)', borderRadius: '50%', textAlign: 'center', color: '#000', lineHeight: '32px' }}>{log.userName.charAt(0)}</div>
+                    <div style={{ width: '32px', height: '32px', background: 'var(--primary)', borderRadius: '50%', textAlign: 'center', color: 'var(--bg-dark)', lineHeight: '32px' }}>{log.userName.charAt(0)}</div>
                     <div>
                       <div style={{ fontSize: '14px', fontWeight: 800 }}>{log.userName}</div>
                       <div style={{ fontSize: '11px', color: 'var(--primary)' }}>{log.action.toUpperCase()}</div>
@@ -236,14 +350,12 @@ export default function App() {
                   </div>
                   <span style={{ color: 'var(--text-muted)', fontSize: '11px' }}>{log.timestamp}</span>
                 </div>
-                <div style={{ padding: '16px', background: '#000', borderRadius: '4px', fontSize: '13px' }}>
-                  <div style={{ opacity: 0.6 }}>TARGET: {log.targetId}</div>
-                  {log.diff.map((d, idx) => (
-                    <div key={idx} style={{ display: 'grid', gridTemplateColumns: '120px 1fr', gap: '10px', marginTop: '8px' }}>
-                      <span style={{ fontWeight: 800, opacity: 0.4 }}>{d.field.toUpperCase()}</span>
-                      <span> <span style={{ color: 'var(--danger)', textDecoration: 'line-through' }}>{d.from}</span> <ChevronRight size={12} style={{ margin: '0 10px' }} /> <span style={{ color: 'var(--success)' }}>{d.to}</span> </span>
-                    </div>
-                  ))}
+                <div style={{ padding: '16px', background: 'var(--bg-dark)', borderRadius: '4px', fontSize: '13px' }}>
+                  <div style={{ opacity: 0.6 }}>TARGET: {log.incidentId}</div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr', gap: '10px', marginTop: '8px' }}>
+                    <span style={{ fontWeight: 800, opacity: 0.4 }}>{log.field.toUpperCase()}</span>
+                    <span> <span style={{ color: 'var(--danger)', textDecoration: 'line-through' }}>{log.previousValue}</span> <ChevronRight size={12} style={{ margin: '0 10px', display: 'inline-block', verticalAlign: 'middle' }} /> <span style={{ color: 'var(--success)' }}>{log.newValue}</span> </span>
+                  </div>
                 </div>
               </div>
             ))}
@@ -273,7 +385,7 @@ export default function App() {
             <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: '40px' }}>
               <div style={{ display: 'flex', gap: '32px', alignItems: 'center' }}>
                  <div style={{ width: '120px', height: '120px', background: 'var(--primary)', borderRadius: '50%', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 40px rgba(30, 215, 96, 0.2)' }}>
-                   <UserIcon size={64} color="#000" />
+                   <UserIcon size={64} color="var(--bg-dark)" />
                  </div>
                  <div>
                    <h2 style={{ fontSize: '32px', fontWeight: 900 }}>{state.currentUser.name}</h2>
@@ -338,7 +450,7 @@ export default function App() {
 
       {/* RBAC Overlay */}
       {state.currentUser.role === 'viewer' && (
-        <div style={{ position: 'fixed', bottom: '30px', right: '30px', background: 'rgba(233, 20, 41, 0.95)', backdropFilter: 'blur(10px)', color: '#fff', padding: '16px 30px', borderRadius: '4px', boxShadow: '0 20px 40px rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', gap: '12px', zIndex: 1000 }}>
+        <div style={{ position: 'fixed', bottom: '30px', right: '30px', background: 'var(--danger)', backdropFilter: 'blur(10px)', color: 'var(--text-primary)', padding: '16px 30px', borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '12px', zIndex: 1000 }}>
           <Lock size={20} /> <div style={{ fontSize: '13px', fontWeight: 900 }}>SECURITY_ALERT: VIEWER_ONLY_MODE</div>
         </div>
       )}
